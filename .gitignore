@@ -1,0 +1,5 @@
+# Local database files - don't commit real pharmacy data
+*.db
+*.db-journal
+medistock
+medistock.exe
