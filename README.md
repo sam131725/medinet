@@ -140,12 +140,59 @@ hardware — an actual GSM modem or an actual Android phone running Termux —
 since this environment has neither. Do one real test with your specific
 hardware before relying on this in an actual emergency.
 
+## Multiple kiosks finding each other: mesh networking
+
+Each kiosk is normally its own island — one machine, one local database, no
+awareness of any other kiosk. `-mesh` changes that: kiosks on the same local
+network automatically discover each other (no IP addresses to type in, the
+same idea behind how a printer or Chromecast just shows up on WiFi), and
+staff get a "which nearby kiosk has this in stock" lookup — useful when a
+relief camp's kiosk runs dry on something a nearby one still has plenty of.
+Still fully offline: this only ever talks over the local network these
+machines already share, never the internet.
+
+```bash
+./medistock -web -mesh -mesh-name "Camp-A Pharmacy"
+```
+
+Every few seconds each kiosk broadcasts a small "I exist, here's my address"
+packet over the local network (UDP broadcast) and listens for the same from
+others, building a live peer list automatically — that's the zero-config
+path. On the staff page, a "Nearby kiosks" panel lists everyone currently
+discovered, and a medicine-code search asks every known peer whether they
+have it in stock (over the same `/api/medicines` endpoint the peer's own
+customer kiosk page already uses — no extra API needed on their end).
+
+Some networks — locked-down enterprise WiFi, and some cloud/virtualized
+network setups — block UDP broadcast between devices as a security measure.
+For that case, `-mesh-peers` lets you list known kiosk addresses directly,
+bypassing broadcast entirely:
+
+```bash
+./medistock -web -mesh -mesh-name "Camp-A Pharmacy" -mesh-peers "192.168.1.6:8080,192.168.1.7:8080"
+```
+
+**What's actually verified:** the peer registry, staleness/expiry, the
+static-peer fallback, and the full cross-kiosk stock lookup are all covered
+by automated tests (`go test ./internal/mesh/... ./internal/webui/...`),
+including an end-to-end test running two real kiosk servers and confirming
+one correctly finds stock on the other. I also ran this manually against
+two real running instances of the actual binary and watched it work.
+Genuine UDP *broadcast* auto-discovery, specifically, was built and tested
+against real sockets, but the cloud environment this was developed in
+silently drops broadcast traffic (a documented limitation of most
+cloud/container networks, confirmed here by checking that plain unicast UDP
+works fine in the same environment — it's not a bug in the code). On a real
+WiFi hotspot or office LAN, broadcast works normally; the automated test for
+it skips (rather than fails) when the network doesn't cooperate, and
+`-mesh-peers` is there as a guaranteed-to-work fallback either way.
+
 ## Reaching a distributor with no internet: SMS reorder alerts
 
-This is a single-location system — by itself it has no way to contact anyone
-outside the machine it runs on. But when a medicine's stock drops to or below
-its reorder level, it can automatically text a distributor/retailer a reorder
-request over SMS (via either transport above), rather than mobile data.
+Beyond mesh (which only lets kiosks find each other), when a medicine's
+stock drops to or below its reorder level, it can automatically text a
+distributor/retailer a reorder request over SMS (via either transport
+above), rather than mobile data.
 This matters because in many outages phone/cell signal survives even when
 internet and data connectivity are down — SMS travels over the carrier's
 signalling channel, not the data network.
@@ -224,12 +271,19 @@ management menu:
 ## Project layout
 
 ```
-main.go                    entry point — opens the DB and starts the CLI
-internal/db/db.go          SQLite connection + schema migration (auto-creates tables)
-internal/models/models.go  data structures: Medicine, Customer, Order, OrderItem
-internal/repo/             database access layer (medicine.go, customer.go, order.go)
-internal/cli/cli.go        interactive terminal menu / UI logic
-vendor/                    vendored dependencies (for offline builds)
+main.go                       entry point — wires everything together, handles flags & shutdown
+internal/db/db.go             SQLite connection + schema migration (auto-creates tables)
+internal/models/models.go     data structures: Medicine, Customer, Order, OrderItem
+internal/repo/                database access layer (medicine.go, customer.go, order.go)
+internal/cli/                 interactive terminal menu + kiosk flow
+internal/webui/               local web kiosk (customer + staff pages, HTTP API)
+internal/sms/                 SMS transports: GSM modem (AT commands) and phone HTTP gateway
+internal/smsorder/            SMS order-parsing (LIST/ORDER/HELP commands)
+internal/alerts/              low-stock -> distributor SMS notifications
+internal/backup/              periodic SQLite backups (VACUUM INTO)
+internal/applog/              shared structured (JSON) logger
+docs/phone-sms-gateway/       reference Termux script for the no-modem SMS option
+vendor/                       vendored dependencies (for offline builds)
 ```
 
 ## How data integrity is handled
@@ -239,9 +293,51 @@ deducts it, records the order and its line items, and computes the total
 together. If anything fails partway (e.g. insufficient stock on one item),
 the whole order is rolled back — nothing is partially saved.
 
+## Production-readiness notes
+
+This started as a prototype and has since had several rounds of hardening.
+Where it stands:
+
+**Tested.** `go test ./...` covers the database/order transaction layer
+(including the rollback-on-insufficient-stock case and the anonymous-order
+foreign-key regression this project actually hit once), the SMS
+order-parsing logic, the HTTP phone-gateway client, database backup/restore,
+and staff auth rate-limiting — all against real SQLite databases and real
+HTTP servers, not mocks. `.github/workflows/ci.yml` runs the full suite
+(build, vet, gofmt check, `go test -race`) on every push/PR.
+
+**Logging.** Every component logs through `internal/applog` as structured
+JSON (`log/slog`) to stderr and optionally a file (`-log-file`) — request
+logs for the web kiosk, SMS transport errors, backup results, auth
+failures/lockouts. This is what you'd actually look at after the fact on an
+unattended kiosk.
+
+**Backups.** The database is backed up automatically on startup and on a
+schedule (`-backup-dir`, `-backup-interval`, `-backup-keep`) using SQLite's
+`VACUUM INTO`, which produces a consistent snapshot without needing to stop
+the app. This is the single most important safety net for a system whose
+entire state lives in one local file.
+
+**Staff auth.** Still a shared PIN, not per-user accounts — but it's now
+rate-limited per IP (5 failed attempts locks that IP out for 5 minutes),
+closing the "brute-force a 4-digit PIN in seconds" hole. Real accounts with
+per-user audit logging would be the next step if that matters for your
+deployment.
+
+**Graceful shutdown.** `Ctrl+C`/`SIGTERM` stops the web server cleanly
+(finishing in-flight requests, up to 10s) and stops the backup/SMS-polling
+goroutines instead of dying mid-request.
+
+**Still open, deliberately out of scope for now** (per an explicit choice
+not to build deployment-specific tooling until a target machine/hardware is
+picked): no Dockerfile or systemd unit, no HTTPS/TLS on the local web kiosk
+(fine on an isolated offline hotspot, not fine if that assumption ever
+breaks), and — as covered above — the SMS transports are verified against
+simulated modems/gateways, not real physical hardware yet.
+
 ## Extending it
 
 - Add a `reports` command to export daily sales to CSV
 - Add prescription/expiry-date validation before allowing a sale
-- Swap the CLI for a local web UI later (the `internal/repo` layer is UI-agnostic,
-  so a Go web server could reuse it directly)
+- Real per-user staff accounts instead of a shared PIN, with an audit log
+- A Dockerfile/systemd unit once a target deployment machine is chosen

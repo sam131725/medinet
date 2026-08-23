@@ -9,15 +9,21 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"medistock/internal/alerts"
+	"medistock/internal/applog"
+	"medistock/internal/backup"
 	"medistock/internal/cli"
 	"medistock/internal/db"
+	"medistock/internal/mesh"
 	"medistock/internal/repo"
 	"medistock/internal/sms"
 	"medistock/internal/smsorder"
@@ -38,6 +44,18 @@ func main() {
 	distributorPhone := flag.String("distributor-phone", "", "phone number to text low-stock reorder alerts to (empty = alerts disabled)")
 	smsOrdering := flag.Bool("sms-ordering", false, "let customers on basic phones place orders by texting the SMS transport's number")
 	smsPollInterval := flag.Duration("sms-poll-interval", 15*time.Second, "how often to check for new incoming SMS orders")
+
+	logFile := flag.String("log-file", "", "also write structured logs to this file (in addition to stderr); empty = stderr only")
+	debug := flag.Bool("debug", false, "enable debug-level logging")
+
+	backupDir := flag.String("backup-dir", "backups", "directory to write periodic database backups into")
+	backupInterval := flag.Duration("backup-interval", 1*time.Hour, "how often to back up the database; 0 disables periodic backups (an initial backup still runs at startup)")
+	backupKeep := flag.Int("backup-keep", 24, "how many recent backups to retain (0 = keep all, not recommended long-term)")
+
+	meshEnabled := flag.Bool("mesh", false, "discover other MediStock kiosks on the local network (zero-config, UDP broadcast) so staff can look up which nearby kiosk has a medicine in stock; requires -web")
+	meshName := flag.String("mesh-name", "", "this kiosk's display name to other kiosks on the mesh (default: auto-generated)")
+	meshUDPPort := flag.Int("mesh-udp-port", 9191, "shared UDP port all MediStock kiosks broadcast/listen on for mesh discovery")
+	meshPeers := flag.String("mesh-peers", "", "comma-separated host:port list of other kiosks to always treat as peers, bypassing broadcast discovery (useful on networks that block UDP broadcast, e.g. locked-down WiFi)")
 	flag.Parse()
 
 	// Backward-compatible: `medistock somefile.db` still works as before.
@@ -45,9 +63,17 @@ func main() {
 		*dbPath = flag.Arg(0)
 	}
 
+	if err := applog.Init(*logFile, *debug); err != nil {
+		fmt.Fprintln(os.Stderr, "failed to set up logging:", err)
+		os.Exit(1)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	sqlDB, err := db.Open(*dbPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "failed to open database:", err)
+		applog.L.Error("failed to open database", "error", err)
 		os.Exit(1)
 	}
 	defer sqlDB.Close()
@@ -56,9 +82,18 @@ func main() {
 	customerRepo := repo.NewCustomerRepo(sqlDB)
 	orderRepo := repo.NewOrderRepo(sqlDB)
 
+	backupRunner := backup.New(sqlDB, *backupDir, *backupKeep, applog.L)
+	if *backupInterval > 0 {
+		backupStop := make(chan struct{})
+		go backupRunner.Run(*backupInterval, backupStop)
+		go func() { <-ctx.Done(); close(backupStop) }()
+	} else if _, err := backupRunner.Once(); err != nil {
+		applog.L.Warn("startup backup failed", "error", err)
+	}
+
 	transport, err := openSMSTransport(*smsGatewayURL, *smsGatewayToken, *smsPort, *smsBaud)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "failed to set up SMS transport:", err)
+		applog.L.Error("failed to set up SMS transport", "error", err)
 		os.Exit(1)
 	}
 	defer transport.Close()
@@ -66,16 +101,23 @@ func main() {
 
 	if *smsOrdering {
 		if *smsGatewayURL == "" && *smsPort == "" {
-			fmt.Println("Note: -sms-ordering is on but no modem or phone gateway is configured, so incoming SMS polling is a no-op. Set -sms-port or -sms-gateway-url once hardware is ready.")
+			applog.L.Warn("sms-ordering enabled with no modem or phone gateway configured - incoming SMS polling is a no-op until -sms-port or -sms-gateway-url is set")
 		}
 		handler := smsorder.New(medicineRepo, customerRepo, orderRepo, notifier)
-		go runSMSOrderLoop(transport, handler, *smsPollInterval)
+		go runSMSOrderLoop(ctx, transport, handler, *smsPollInterval)
 	}
 
 	if *web {
 		server := webui.New(medicineRepo, customerRepo, orderRepo, notifier, *staffPIN)
-		if err := server.Run(*port); err != nil {
-			fmt.Fprintln(os.Stderr, "web server error:", err)
+
+		if *meshEnabled {
+			setUpMesh(ctx, server, *meshName, *port, *meshUDPPort, *meshPeers)
+		} else if *meshPeers != "" {
+			applog.L.Warn("-mesh-peers was set but -mesh is not enabled; ignoring")
+		}
+
+		if err := server.Run(ctx, *port); err != nil {
+			applog.L.Error("web server error", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -83,6 +125,62 @@ func main() {
 
 	app := cli.NewApp(medicineRepo, customerRepo, orderRepo, notifier)
 	app.Run()
+}
+
+// setUpMesh wires zero-config peer discovery (and any statically configured
+// peers) into the web server, then starts the broadcast/listen loop in the
+// background. Mesh networking is entirely best-effort: if it can't figure
+// out this machine's LAN address, or the network blocks UDP broadcast, the
+// rest of the app keeps working exactly as if -mesh had never been passed.
+func setUpMesh(ctx context.Context, server *webui.Server, name string, httpPort, udpPort int, staticPeers string) {
+	localIP := mesh.LocalIPv4()
+	if localIP == "" {
+		applog.L.Warn("mesh: could not determine a local network address; mesh discovery disabled")
+		return
+	}
+	httpAddr := fmt.Sprintf("%s:%d", localIP, httpPort)
+
+	discovery, err := mesh.New(name, httpAddr, udpPort, applog.L)
+	if err != nil {
+		applog.L.Error("mesh: failed to start", "error", err)
+		return
+	}
+	applog.L.Info("mesh: starting peer discovery", "nodeId", discovery.NodeID(), "advertisedAddr", httpAddr)
+	server.SetDiscovery(discovery)
+	go discovery.Run(ctx)
+
+	if staticPeers != "" {
+		go refreshStaticPeers(ctx, discovery, staticPeers)
+	}
+}
+
+// refreshStaticPeers re-registers every address in a comma-separated
+// host:port list every 10s, since Discovery ages out any peer not heard
+// from recently - a static peer needs the same periodic "still here"
+// refresh a broadcast peer gets automatically.
+func refreshStaticPeers(ctx context.Context, discovery *mesh.Discovery, peerList string) {
+	addrs := strings.Split(peerList, ",")
+	add := func() {
+		for _, addr := range addrs {
+			addr = strings.TrimSpace(addr)
+			if addr == "" {
+				continue
+			}
+			discovery.AddStaticPeer(addr, addr, addr)
+		}
+	}
+
+	add()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			add()
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // openSMSTransport picks the SMS backend: a phone-based HTTP gateway if
@@ -97,22 +195,27 @@ func openSMSTransport(gatewayURL, gatewayToken, modemPort string, modemBaud int)
 
 // runSMSOrderLoop polls the SMS transport for unread messages at a fixed
 // interval, hands each one to the order handler, texts back the reply, and
-// acknowledges it so it isn't processed twice. Runs until the process exits.
-func runSMSOrderLoop(transport sms.Transport, handler *smsorder.Handler, interval time.Duration) {
+// acknowledges it so it isn't processed twice. Stops when ctx is cancelled.
+func runSMSOrderLoop(ctx context.Context, transport sms.Transport, handler *smsorder.Handler, interval time.Duration) {
 	for {
 		messages, err := transport.ReadUnread()
 		if err != nil {
-			log.Printf("sms-ordering: failed to read incoming messages: %v", err)
+			applog.L.Error("sms-ordering: failed to read incoming messages", "error", err)
 		}
 		for _, msg := range messages {
 			reply := handler.HandleMessage(msg.From, msg.Body)
 			if err := transport.SendSMS(msg.From, reply); err != nil {
-				log.Printf("sms-ordering: failed to reply to %s: %v", msg.From, err)
+				applog.L.Error("sms-ordering: failed to reply", "to", msg.From, "error", err)
 			}
 			if err := transport.Ack(msg.ID); err != nil {
-				log.Printf("sms-ordering: failed to acknowledge processed message %s: %v", msg.ID, err)
+				applog.L.Error("sms-ordering: failed to acknowledge processed message", "id", msg.ID, "error", err)
 			}
 		}
-		time.Sleep(interval)
+
+		select {
+		case <-time.After(interval):
+		case <-ctx.Done():
+			return
+		}
 	}
 }

@@ -396,6 +396,21 @@ const staffPageHTML = `<!DOCTYPE html>
       </table>
     </div>
 
+    <div class="card">
+      <h2>Nearby kiosks (mesh network)</h2>
+      <p style="font-size:13px;color:var(--muted);margin-top:0;">Other MediStock kiosks discovered on this local network - still no internet, just local broadcast.</p>
+      <div id="mesh-status" style="font-size:13px;margin-bottom:10px;"></div>
+      <table id="mesh-peers-table">
+        <thead><tr><th>Kiosk</th><th>Address</th><th>Last seen</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="form-grid" style="margin-top:14px;">
+        <input id="mesh-find-code" placeholder="Medicine code, e.g. PARA">
+      </div>
+      <button onclick="meshFind()">Find who has it in stock</button>
+      <div id="mesh-find-results" style="margin-top:10px;"></div>
+    </div>
+
   </div>
 </div>
 
@@ -425,6 +440,59 @@ function staffFetch(url, opts) {
 async function refreshAll() {
   await loadInventory();
   await loadOrders();
+  await loadMeshPeers();
+}
+
+async function loadMeshPeers() {
+  const statusEl = document.getElementById('mesh-status');
+  const tbody = document.querySelector('#mesh-peers-table tbody');
+  try {
+    const res = await staffFetch('/api/staff/mesh/peers');
+    const data = await res.json();
+    tbody.innerHTML = '';
+    if (!data.enabled) {
+      statusEl.textContent = 'Mesh networking is not enabled on this kiosk (start with -mesh-name to turn it on).';
+      return;
+    }
+    const peers = data.peers || [];
+    statusEl.textContent = peers.length === 0
+      ? 'This kiosk node ID: ' + data.nodeId + '. No other kiosks discovered yet.'
+      : 'This kiosk node ID: ' + data.nodeId + '. ' + peers.length + ' nearby kiosk(s) found.';
+    peers.forEach(p => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td></td><td></td><td></td>';
+      tr.children[0].textContent = p.name;
+      tr.children[1].textContent = p.httpAddr;
+      tr.children[2].textContent = new Date(p.lastSeen).toLocaleTimeString();
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    statusEl.textContent = 'Could not load mesh status.';
+  }
+}
+
+async function meshFind() {
+  const code = document.getElementById('mesh-find-code').value.trim();
+  const resultsEl = document.getElementById('mesh-find-results');
+  if (!code) { resultsEl.textContent = 'Enter a medicine code first.'; return; }
+  resultsEl.textContent = 'Searching nearby kiosks...';
+  try {
+    const res = await staffFetch('/api/staff/mesh/find?code=' + encodeURIComponent(code));
+    const results = await res.json();
+    if (!results || results.length === 0) {
+      resultsEl.textContent = 'No nearby kiosk currently reports stock for "' + code + '".';
+      return;
+    }
+    resultsEl.innerHTML = '';
+    results.forEach(r => {
+      const div = document.createElement('div');
+      div.style.padding = '6px 0';
+      div.textContent = r.peer.name + ' (' + r.peer.httpAddr + '): ' + r.name + ' x' + r.quantity + ' in stock';
+      resultsEl.appendChild(div);
+    });
+  } catch (e) {
+    resultsEl.textContent = 'Search failed.';
+  }
 }
 
 async function loadInventory() {

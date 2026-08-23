@@ -5,14 +5,19 @@
 package webui
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strconv"
+	"time"
 
 	"medistock/internal/alerts"
+	"medistock/internal/applog"
+	"medistock/internal/mesh"
 	"medistock/internal/models"
 	"medistock/internal/repo"
 )
@@ -23,10 +28,22 @@ type Server struct {
 	orders    *repo.OrderRepo
 	notifier  *alerts.Notifier
 	staffPIN  string
+	limiter   *loginLimiter
+	startedAt time.Time
+	discovery *mesh.Discovery // optional - nil if mesh networking with other kiosks isn't enabled
 }
 
+// SetDiscovery attaches mesh peer discovery to this server, enabling the
+// /api/mesh/* endpoints and the staff "Nearby Kiosks" panel. Optional -
+// without it, mesh endpoints report the feature as disabled.
+func (s *Server) SetDiscovery(d *mesh.Discovery) { s.discovery = d }
+
 func New(medicines *repo.MedicineRepo, customers *repo.CustomerRepo, orders *repo.OrderRepo, notifier *alerts.Notifier, staffPIN string) *Server {
-	return &Server{medicines: medicines, customers: customers, orders: orders, notifier: notifier, staffPIN: staffPIN}
+	return &Server{
+		medicines: medicines, customers: customers, orders: orders, notifier: notifier, staffPIN: staffPIN,
+		limiter:   newLoginLimiter(5, 5*time.Minute), // 5 failed PINs -> 5 minute lockout for that IP
+		startedAt: time.Now(),
+	}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -36,23 +53,64 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/", s.handleCustomerPage)
 	mux.HandleFunc("/staff", s.handleStaffPage)
 
+	// Operational
+	mux.HandleFunc("/healthz", s.handleHealthz)
+
 	// Customer-facing API
 	mux.HandleFunc("/api/medicines", s.handleAvailableMedicines) // GET, only in-stock items
 	mux.HandleFunc("/api/checkout", s.handleCheckout)            // POST
 	mux.HandleFunc("/api/order", s.handleGetOrder)               // GET ?id=
 
-	// Staff API (PIN-protected)
+	// Staff API (PIN-protected, rate-limited)
 	mux.HandleFunc("/api/staff/medicines", s.staffAuth(s.handleStaffMedicines)) // GET (all) / POST (add)
 	mux.HandleFunc("/api/staff/stock", s.staffAuth(s.handleStaffAdjustStock))   // POST
 	mux.HandleFunc("/api/staff/orders", s.staffAuth(s.handleStaffOrders))       // GET
 
-	return mux
+	// Mesh: other MediStock kiosks discovered on the local network
+	mux.HandleFunc("/api/staff/mesh/peers", s.staffAuth(s.handleMeshPeers)) // GET
+	mux.HandleFunc("/api/staff/mesh/find", s.staffAuth(s.handleMeshFind))   // GET ?code=
+
+	return withRequestLogging(mux)
+}
+
+// withRequestLogging wraps a handler so every request is logged with its
+// method, path, remote address, status code, and duration - the minimum
+// needed to investigate "what happened" after the fact on an unattended
+// kiosk, instead of having no record at all.
+func withRequestLogging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		applog.L.Info("http request",
+			"method", r.Method, "path", r.URL.Path, "remote", clientIP(r),
+			"status", sw.status, "duration_ms", time.Since(start).Milliseconds())
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":       "ok",
+		"uptimeSecond": int(time.Since(s.startedAt).Seconds()),
+	})
 }
 
 // Run starts the HTTP server on the given port, printing every local
 // network address it can be reached on (so staff can share the right URL
-// with a phone/tablet connected to the same offline WiFi hotspot).
-func (s *Server) Run(port int) error {
+// with a phone/tablet connected to the same offline WiFi hotspot). It
+// blocks until ctx is cancelled, then shuts down gracefully (in-flight
+// requests get up to 10s to finish) before returning.
+func (s *Server) Run(ctx context.Context, port int) error {
 	addr := fmt.Sprintf(":%d", port)
 	fmt.Println("=================================================")
 	fmt.Println(" MediStock web kiosk starting")
@@ -65,7 +123,26 @@ func (s *Server) Run(port int) error {
 	}
 	fmt.Println("Share that network address with devices on the same offline WiFi/hotspot.")
 	fmt.Println("Press Ctrl+C to stop.")
-	return http.ListenAndServe(addr, s.Handler())
+
+	httpServer := &http.Server{Addr: addr, Handler: s.Handler()}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- httpServer.ListenAndServe()
+	}()
+
+	select {
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		applog.L.Info("shutting down web server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	}
 }
 
 func localIPv4s() []string {
@@ -110,19 +187,30 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // staffAuth requires an "X-Staff-Pin" header (or "pin" query param) matching
 // the configured staff PIN before allowing access to inventory-mutating
-// endpoints. This is a lightweight deterrent, not real authentication - it
-// exists so a member of the public at the customer kiosk can't casually
-// browse to /staff and edit stock.
+// endpoints, and rate-limits repeated failures per IP. This is a
+// lightweight deterrent, not real authentication - it exists so a member
+// of the public at the customer kiosk can't casually browse to /staff and
+// edit stock, and can't brute-force a short PIN in a tight loop.
 func (s *Server) staffAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if !s.limiter.allowed(ip) {
+			applog.L.Warn("staff auth locked out", "remote", ip)
+			writeError(w, http.StatusTooManyRequests, "too many failed PIN attempts - try again in a few minutes")
+			return
+		}
+
 		pin := r.Header.Get("X-Staff-Pin")
 		if pin == "" {
 			pin = r.URL.Query().Get("pin")
 		}
 		if subtle.ConstantTimeCompare([]byte(pin), []byte(s.staffPIN)) != 1 {
+			s.limiter.recordFailure(ip)
+			applog.L.Warn("staff auth failed", "remote", ip)
 			writeError(w, http.StatusUnauthorized, "invalid or missing staff PIN")
 			return
 		}
+		s.limiter.recordSuccess(ip)
 		next(w, r)
 	}
 }
@@ -282,6 +370,34 @@ func (s *Server) handleStaffAdjustStock(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, m)
+}
+
+// ---- mesh (nearby kiosks) API ----
+
+func (s *Server) handleMeshPeers(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": false, "peers": []mesh.Peer{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled": true,
+		"nodeId":  s.discovery.NodeID(),
+		"peers":   s.discovery.Peers(),
+	})
+}
+
+func (s *Server) handleMeshFind(w http.ResponseWriter, r *http.Request) {
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		writeError(w, http.StatusBadRequest, "code is required")
+		return
+	}
+	if s.discovery == nil {
+		writeJSON(w, http.StatusOK, []mesh.StockElsewhere{})
+		return
+	}
+	results := mesh.FindAcrossPeers(s.discovery.Peers(), code)
+	writeJSON(w, http.StatusOK, results)
 }
 
 func (s *Server) handleStaffOrders(w http.ResponseWriter, r *http.Request) {
