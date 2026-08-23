@@ -3,23 +3,20 @@ package repo
 import (
 	"database/sql"
 
+	"medistock/internal/db"
 	"medistock/internal/models"
 )
 
 type CustomerRepo struct {
-	db *sql.DB
+	db *db.DB
 }
 
-func NewCustomerRepo(db *sql.DB) *CustomerRepo {
-	return &CustomerRepo{db: db}
+func NewCustomerRepo(d *db.DB) *CustomerRepo {
+	return &CustomerRepo{db: d}
 }
 
 func (r *CustomerRepo) Add(c models.Customer) (int64, error) {
-	res, err := r.db.Exec(`INSERT INTO customers (name, phone) VALUES (?, ?)`, c.Name, c.Phone)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
+	return r.db.InsertReturningID(`INSERT INTO customers (name, phone) VALUES (?, ?)`, c.Name, c.Phone)
 }
 
 func (r *CustomerRepo) List() ([]models.Customer, error) {

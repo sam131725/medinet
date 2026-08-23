@@ -1,21 +1,21 @@
 package repo
 
 import (
-	"database/sql"
 	"fmt"
 	"regexp"
 	"strings"
 
+	"medistock/internal/db"
 	"medistock/internal/models"
 )
 
 // MedicineRepo provides CRUD and stock operations for medicines.
 type MedicineRepo struct {
-	db *sql.DB
+	db *db.DB
 }
 
-func NewMedicineRepo(db *sql.DB) *MedicineRepo {
-	return &MedicineRepo{db: db}
+func NewMedicineRepo(d *db.DB) *MedicineRepo {
+	return &MedicineRepo{db: d}
 }
 
 const medicineColumns = `id, name, code, manufacturer, batch, expiry_date, price, quantity, reorder_level, max_per_order, low_stock_alert_sent`
@@ -29,6 +29,17 @@ func scanMedicine(row interface{ Scan(...interface{}) error }) (models.Medicine,
 }
 
 var nonAlnum = regexp.MustCompile(`[^A-Z0-9]+`)
+
+// codeEqualsClause returns a WHERE-fragment for a case-insensitive code
+// match plus its argument, adapting to whichever database is in use:
+// SQLite's COLLATE NOCASE, or a LOWER() comparison for Postgres (which has
+// no NOCASE collation).
+func (r *MedicineRepo) codeEqualsClause(code string) (string, string) {
+	if r.db.Driver == db.DriverPostgres {
+		return "LOWER(code) = LOWER(?)", code
+	}
+	return "code = ? COLLATE NOCASE", code
+}
 
 // generateCode derives a short, SMS-friendly code from a medicine name
 // (e.g. "Paracetamol 500mg" -> "PARACETA"), appending a numeric suffix if
@@ -44,8 +55,9 @@ func (r *MedicineRepo) generateCode(name string) (string, error) {
 
 	candidate := base
 	for i := 1; ; i++ {
+		clause, arg := r.codeEqualsClause(candidate)
 		var exists int
-		err := r.db.QueryRow(`SELECT COUNT(*) FROM medicines WHERE code = ? COLLATE NOCASE`, candidate).Scan(&exists)
+		err := r.db.QueryRow(`SELECT COUNT(*) FROM medicines WHERE `+clause, arg).Scan(&exists)
 		if err != nil {
 			return "", err
 		}
@@ -67,7 +79,7 @@ func (r *MedicineRepo) Add(m models.Medicine) (int64, error) {
 		m.Code = strings.ToUpper(strings.TrimSpace(m.Code))
 	}
 
-	res, err := r.db.Exec(
+	id, err := r.db.InsertReturningID(
 		`INSERT INTO medicines (name, code, manufacturer, batch, expiry_date, price, quantity, reorder_level, max_per_order)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		m.Name, m.Code, m.Manufacturer, m.Batch, m.ExpiryDate, m.Price, m.Quantity, m.ReorderLevel, m.MaxPerOrder,
@@ -75,7 +87,7 @@ func (r *MedicineRepo) Add(m models.Medicine) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("insert medicine: %w", err)
 	}
-	return res.LastInsertId()
+	return id, nil
 }
 
 func (r *MedicineRepo) Update(m models.Medicine) error {
@@ -100,7 +112,8 @@ func (r *MedicineRepo) Get(id int64) (models.Medicine, error) {
 // FindByCode looks up a medicine by its short SMS-ordering code
 // (case-insensitive). Used by the SMS order handler.
 func (r *MedicineRepo) FindByCode(code string) (models.Medicine, error) {
-	row := r.db.QueryRow(`SELECT `+medicineColumns+` FROM medicines WHERE code = ? COLLATE NOCASE`, strings.TrimSpace(code))
+	clause, arg := r.codeEqualsClause(strings.TrimSpace(code))
+	row := r.db.QueryRow(`SELECT `+medicineColumns+` FROM medicines WHERE `+clause, arg)
 	return scanMedicine(row)
 }
 

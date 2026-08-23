@@ -13,7 +13,7 @@ import (
 
 func TestBackup_OnceCreatesRestorableSnapshot(t *testing.T) {
 	dbDir := t.TempDir()
-	sqlDB, err := db.Open(filepath.Join(dbDir, "live.db"))
+	sqlDB, err := db.OpenSQLite(filepath.Join(dbDir, "live.db"))
 	if err != nil {
 		t.Fatalf("open live db: %v", err)
 	}
@@ -41,7 +41,7 @@ func TestBackup_OnceCreatesRestorableSnapshot(t *testing.T) {
 
 	// Open the backup file as its own independent database and confirm the
 	// data is really there - this is the actual point of a backup.
-	restored, err := db.Open(path)
+	restored, err := db.OpenSQLite(path)
 	if err != nil {
 		t.Fatalf("open backup as db: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestBackup_OnceCreatesRestorableSnapshot(t *testing.T) {
 
 func TestBackup_PrunesOldBackups(t *testing.T) {
 	dbDir := t.TempDir()
-	sqlDB, err := db.Open(filepath.Join(dbDir, "live.db"))
+	sqlDB, err := db.OpenSQLite(filepath.Join(dbDir, "live.db"))
 	if err != nil {
 		t.Fatalf("open live db: %v", err)
 	}
@@ -81,6 +81,44 @@ func TestBackup_PrunesOldBackups(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Errorf("expected exactly 2 backups retained (keep=2), got %d", len(entries))
+	}
+}
+
+// TestBackup_Postgres_UsesPgDump confirms the Postgres path shells out to
+// pg_dump (rather than trying SQLite's VACUUM INTO, which Postgres doesn't
+// have) with the expected file extension and connection details - using an
+// injected fake instead of a real pg_dump binary so this test doesn't
+// depend on Postgres being installed. The real pg_dump invocation was
+// additionally verified manually end-to-end against a live local Postgres
+// server and a running kiosk instance (see internal/repo/postgres_test.go
+// for the automated equivalent, which does use a real Postgres server when
+// one is reachable).
+func TestBackup_Postgres_UsesPgDump(t *testing.T) {
+	pgDB := &db.DB{Driver: db.DriverPostgres, PostgresConfig: db.Config{
+		Driver: db.DriverPostgres, Host: "localhost", Port: 5432, User: "postgres", Password: "secret", DBName: "medistock",
+	}}
+
+	backupDir := t.TempDir()
+	r := New(pgDB, backupDir, 0, nil)
+
+	var calledWith string
+	r.pgDump = func(path string) error {
+		calledWith = path
+		return os.WriteFile(path, []byte("-- fake pg_dump output"), 0o644)
+	}
+
+	path, err := r.Once()
+	if err != nil {
+		t.Fatalf("Once() failed: %v", err)
+	}
+	if calledWith != path {
+		t.Errorf("expected pg_dump to be called with the backup path %q, got %q", path, calledWith)
+	}
+	if filepath.Ext(path) != ".sql" {
+		t.Errorf("expected a .sql backup file for Postgres, got %q", path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("backup file missing: %v", err)
 	}
 }
 

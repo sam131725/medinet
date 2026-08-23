@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"time"
 
+	"medistock/internal/db"
 	"medistock/internal/models"
 )
 
 type OrderRepo struct {
-	db *sql.DB
+	db *db.DB
 }
 
-func NewOrderRepo(db *sql.DB) *OrderRepo {
-	return &OrderRepo{db: db}
+func NewOrderRepo(d *db.DB) *OrderRepo {
+	return &OrderRepo{db: d}
 }
 
 // CartLine is a requested line item before stock/price are resolved.
@@ -47,14 +48,10 @@ func (r *OrderRepo) Create(customerID int64, lines []CartLine) (models.Order, er
 	defer tx.Rollback()
 
 	now := time.Now()
-	res, err := tx.Exec(`INSERT INTO orders (customer_id, created_at, total) VALUES (?, ?, 0)`,
+	orderID, err := tx.InsertReturningID(`INSERT INTO orders (customer_id, created_at, total) VALUES (?, ?, 0)`,
 		nullableID(customerID), now.Format(time.RFC3339))
 	if err != nil {
 		return models.Order{}, fmt.Errorf("create order: %w", err)
-	}
-	orderID, err := res.LastInsertId()
-	if err != nil {
-		return models.Order{}, err
 	}
 
 	var total float64
@@ -83,7 +80,7 @@ func (r *OrderRepo) Create(customerID int64, lines []CartLine) (models.Order, er
 			return models.Order{}, fmt.Errorf("deduct stock: %w", err)
 		}
 
-		itemRes, err := tx.Exec(
+		itemID, err := tx.InsertReturningID(
 			`INSERT INTO order_items (order_id, medicine_id, quantity, unit_price, subtotal)
 			 VALUES (?, ?, ?, ?, ?)`,
 			orderID, line.MedicineID, line.Quantity, price, subtotal,
@@ -91,7 +88,6 @@ func (r *OrderRepo) Create(customerID int64, lines []CartLine) (models.Order, er
 		if err != nil {
 			return models.Order{}, fmt.Errorf("insert order item: %w", err)
 		}
-		itemID, _ := itemRes.LastInsertId()
 
 		items = append(items, models.OrderItem{
 			ID: itemID, OrderID: orderID, MedicineID: line.MedicineID, MedicineName: name,

@@ -23,7 +23,7 @@ func testMedicine(name string, price float64, qty, maxPerOrder int) models.Medic
 func newTestHandler(t *testing.T) *Handler {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	sqlDB, err := db.Open(dbPath)
+	sqlDB, err := db.OpenSQLite(dbPath)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

@@ -10,7 +10,7 @@ import (
 
 func newTestDB(t *testing.T) (*MedicineRepo, *CustomerRepo, *OrderRepo) {
 	t.Helper()
-	sqlDB, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	sqlDB, err := db.OpenSQLite(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

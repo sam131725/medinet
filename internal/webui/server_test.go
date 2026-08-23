@@ -25,7 +25,7 @@ func testMedicineFor(t *testing.T, name, code string, qty int) models.Medicine {
 
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
-	sqlDB, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
+	sqlDB, err := db.OpenSQLite(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}

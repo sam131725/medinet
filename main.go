@@ -33,7 +33,14 @@ import (
 func main() {
 	web := flag.Bool("web", false, "serve a touch-friendly local web kiosk instead of the terminal menu")
 	port := flag.Int("port", 8080, "port for the web kiosk (only used with -web)")
-	dbPath := flag.String("db", "medistock.db", "path to the local SQLite database file")
+	dbPath := flag.String("db", "medistock.db", "path to the local SQLite database file (used unless -db-driver=postgres)")
+	dbDriver := flag.String("db-driver", "sqlite", "database engine: \"sqlite\" (default, single local file, no server needed) or \"postgres\" (a Postgres server running locally)")
+	pgHost := flag.String("pg-host", "localhost", "Postgres host (only used with -db-driver=postgres; should be a machine on your local network, not the internet)")
+	pgPort := flag.Int("pg-port", 5432, "Postgres port")
+	pgUser := flag.String("pg-user", "", "Postgres username")
+	pgPassword := flag.String("pg-password", "", "Postgres password")
+	pgDBName := flag.String("pg-dbname", "medistock", "Postgres database name")
+	pgSSLMode := flag.String("pg-sslmode", "disable", "Postgres sslmode (\"disable\" is normal for a local/offline instance with no certificate)")
 	staffPIN := flag.String("staff-pin", "1234", "PIN required to access the staff page/API in web mode (change this!)")
 
 	smsPort := flag.String("sms-port", "", "serial device for a GSM modem, e.g. /dev/ttyUSB0")
@@ -71,9 +78,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	sqlDB, err := db.Open(*dbPath)
+	sqlDB, err := db.Open(db.Config{
+		Driver:   *dbDriver,
+		Path:     *dbPath,
+		Host:     *pgHost,
+		Port:     *pgPort,
+		User:     *pgUser,
+		Password: *pgPassword,
+		DBName:   *pgDBName,
+		SSLMode:  *pgSSLMode,
+	})
 	if err != nil {
-		applog.L.Error("failed to open database", "error", err)
+		applog.L.Error("failed to open database", "error", err, "driver", *dbDriver)
 		os.Exit(1)
 	}
 	defer sqlDB.Close()

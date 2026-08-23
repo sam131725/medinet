@@ -9,6 +9,24 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+
+    # A local Postgres service so the internal/repo Postgres tests (which
+    # skip gracefully when no server is reachable) actually run in CI
+    # instead of always being skipped.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,8 +34,8 @@ jobs:
         with:
           go-version: '1.21'
 
-      - name: Install build dependencies (cgo needs gcc + sqlite headers)
-        run: sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev
+      - name: Install build dependencies (cgo needs gcc + sqlite headers; postgresql-client provides pg_dump for the backup path)
+        run: sudo apt-get update && sudo apt-get install -y build-essential libsqlite3-dev postgresql-client
 
       - name: Check formatting
         run: |
@@ -35,4 +53,8 @@ jobs:
         run: go build -mod=vendor -o medistock .
 
       - name: Test
+        env:
+          MEDISTOCK_TEST_PG_HOST: localhost
+          MEDISTOCK_TEST_PG_USER: postgres
+          MEDISTOCK_TEST_PG_PASSWORD: postgres
         run: go test -mod=vendor -race -v ./...

@@ -268,6 +268,45 @@ management menu:
 9. Back to main menu
 ```
 
+## Choosing a database: SQLite (default) or Postgres
+
+By default MediStock stores everything in a single local SQLite file
+(`medistock.db`) — no database server to install or run, which is why it's
+the default for a kiosk that just needs to work. If you'd rather run a
+proper Postgres server locally (still fully offline — this only ever talks
+to a host on your own machine or local network, never the internet),
+`-db-driver postgres` switches to it:
+
+```bash
+./medistock -web -db-driver postgres \
+  -pg-host localhost -pg-port 5432 \
+  -pg-user postgres -pg-password yourpassword -pg-dbname medistock
+```
+
+The database (`medistock` by default) must already exist on the Postgres
+server — MediStock creates its tables inside it on first run, but won't
+create the database itself. `-pg-sslmode` defaults to `disable`, which is
+normal for a local instance with no certificate; set it if your setup needs
+otherwise.
+
+Everything works the same either way — same CLI, same web kiosk, same SMS
+ordering, same mesh networking. The one difference: scheduled backups
+(`-backup-interval`) use SQLite's `VACUUM INTO` for a SQLite database, or
+shell out to `pg_dump` for Postgres (install the `postgresql-client`
+package to get it — `sudo apt install postgresql-client` on Debian/Ubuntu).
+
+**What's verified:** every repo-layer operation (adding medicines,
+generating unique SMS codes, placing orders inside a transaction that
+rolls back on insufficient stock, case-insensitive code lookups) is covered
+by tests that run for real against a local Postgres server
+(`internal/repo/postgres_test.go` — they skip, rather than fail, if no
+Postgres is reachable, and CI runs a real Postgres service so they aren't
+just skipped there either). I also ran the actual compiled binary as a web
+kiosk against a real local Postgres database end-to-end: added a medicine,
+placed an order through the customer checkout API, and confirmed via `psql`
+that the stock deduction, order, and order line item all landed correctly
+— and confirmed a real `pg_dump` backup file was produced and readable.
+
 ## Project layout
 
 ```
@@ -303,8 +342,11 @@ Where it stands:
 foreign-key regression this project actually hit once), the SMS
 order-parsing logic, the HTTP phone-gateway client, database backup/restore,
 and staff auth rate-limiting — all against real SQLite databases and real
-HTTP servers, not mocks. `.github/workflows/ci.yml` runs the full suite
-(build, vet, gofmt check, `go test -race`) on every push/PR.
+HTTP servers, not mocks; the same transaction/rollback/unique-code behavior
+is also covered against a real Postgres server (see "Choosing a database"
+above). `.github/workflows/ci.yml` runs the full suite (build, vet, gofmt
+check, `go test -race`), including the Postgres tests against a real
+Postgres service container, on every push/PR.
 
 **Logging.** Every component logs through `internal/applog` as structured
 JSON (`log/slog`) to stderr and optionally a file (`-log-file`) — request
@@ -313,10 +355,11 @@ failures/lockouts. This is what you'd actually look at after the fact on an
 unattended kiosk.
 
 **Backups.** The database is backed up automatically on startup and on a
-schedule (`-backup-dir`, `-backup-interval`, `-backup-keep`) using SQLite's
-`VACUUM INTO`, which produces a consistent snapshot without needing to stop
-the app. This is the single most important safety net for a system whose
-entire state lives in one local file.
+schedule (`-backup-dir`, `-backup-interval`, `-backup-keep`) — using
+SQLite's `VACUUM INTO` for a SQLite database, or `pg_dump` for Postgres —
+which produces a consistent snapshot without needing to stop the app. This
+is the single most important safety net for a system whose entire state
+lives in one local file or one local database server.
 
 **Staff auth.** Still a shared PIN, not per-user accounts — but it's now
 rate-limited per IP (5 failed attempts locks that IP out for 5 minutes),

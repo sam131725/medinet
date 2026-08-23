@@ -3,5 +3,5 @@
 *.db-journal
 medistock
 medistock.exe
-_to_delete/
 .idea/
+_to_delete/
