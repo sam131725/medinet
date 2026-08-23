@@ -48,6 +48,67 @@ sudo systemctl enable --now medistock
 `Restart=always` is the important part — if the process dies for any
 reason, systemd brings it back within 5 seconds, no one needs to notice.
 
+### Concretely: on a real Raspberry Pi
+
+This is Option 1 above, worked through end to end for a Raspberry Pi 4 or
+5 (2GB RAM or more is plenty), since it's the cheapest, lowest-power,
+easiest-to-source hardware that fits this project well.
+
+**1. Flash the OS.** Use the [Raspberry Pi
+Imager](https://www.raspberrypi.com/software/) on your own computer.
+Choose **Raspberry Pi OS Lite (64-bit)** — no desktop environment needed,
+this only ever runs headless. Before writing, open the imager's advanced
+options (gear icon) and set a hostname, enable SSH, and enter your WiFi
+details — this lets you set the Pi up completely headless, no monitor or
+keyboard needed for it ever.
+
+**2. Get the binary onto the Pi.** Two ways:
+
+- *Build it on the Pi itself* (simplest, needs the Pi to have internet for
+  this one-time step — normal, since it's still being provisioned, not yet
+  deployed to the field):
+  ```bash
+  ssh pi@<pi's address>
+  sudo apt update && sudo apt install -y golang build-essential git
+  git clone https://github.com/sam131725/medinet.git medistock
+  cd medistock
+  go build -mod=vendor -o medistock .
+  ```
+- *Cross-compile elsewhere and copy it over* (faster, and means the Pi
+  never needs internet or a Go toolchain at all — useful if you're setting
+  up several Pis). From a Linux machine with a cross-compiler
+  (`sudo apt install gcc-aarch64-linux-gnu`):
+  ```bash
+  CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
+    go build -mod=vendor -ldflags="-s -w" -o medistock-linux-arm64 .
+  scp medistock-linux-arm64 pi@<pi's address>:~/medistock
+  ```
+  This cross-compilation path was actually run and verified — the
+  resulting `arm64` binary was executed under `qemu-aarch64` emulation
+  (which runs real ARM64 machine code, not a simulation of Pi-specific
+  behavior) and confirmed to serve the web kiosk and handle real SQLite
+  reads/writes correctly. That's strong evidence it'll run correctly on
+  real Pi hardware, though emulation isn't a perfect substitute for the
+  real thing — if you go this route, still worth doing a quick smoke test
+  after copying it over.
+
+**3. Set it up as a systemd service** — follow the systemd steps earlier
+in this section (`/etc/systemd/system/medistock.service`), pointing
+`ExecStart` at wherever you put the binary (e.g. `/home/pi/medistock`).
+Once `systemctl enable --now medistock` is run, it starts on every boot
+and restarts itself if it ever crashes — exactly the "plug it in and
+forget it" behavior a kiosk needs.
+
+**4. Reach it from other devices.** Once running, find the Pi's local IP
+(`hostname -I` on the Pi, or check your router's connected-devices list)
+and open `http://<that IP>:8080` from any phone/tablet on the same WiFi —
+that's the customer kiosk. `/staff` is the staff page. If you want the Pi
+itself to also be the WiFi hotspot (rather than joining an existing
+network — useful if there's no router at all on-site), set it up as a
+WiFi access point using Raspberry Pi OS's built-in `nmcli`/`raspi-config`
+tools; that's a standard Pi networking task independent of this project,
+well covered by Raspberry Pi's own documentation.
+
 ## Option 2: Docker
 
 Useful if you're comfortable with containers, want the same reproducible
