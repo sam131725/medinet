@@ -20,6 +20,36 @@ configurable max-quantity-per-order cap to prevent hoarding, real-time stock
 enforcement, and automatic low-stock SMS alerts to a distributor. See below
 for full setup of each.
 
+## Why this exists
+
+The gap this fills is specific: the moment right after a disaster —
+earthquake, flood, cyclone — when broadband and mobile data are the first
+things to go down, but people still urgently need medicine, and a pharmacy
+or relief camp still has stock sitting on a shelf with no way to organize
+who gets what. Paper logs work but don't stop hoarding, don't track stock
+in real time, and don't scale past one line of people. This project's bet
+is that a machine that keeps working through exactly that failure mode —
+no internet, possibly no reliable power, staff who may not be trained on
+it in advance — is worth more in that moment than a much more capable
+system that needs connectivity it won't have.
+
+A few design choices follow directly from that: the per-order quantity cap
+exists because uncontrolled demand during a shortage is its own hazard, not
+just an inconvenience — it's there to keep a limited supply reaching more
+people rather than emptying to whoever's fastest. SMS ordering exists
+because a smartphone and a data plan are real barriers to plenty of the
+people this is meant to serve, and a feature phone with cell signal often
+isn't. And every fallback (mesh's static-peer option, the phone-based SMS
+gateway instead of dedicated modem hardware, the plain terminal mode with
+no network at all) exists because "the ideal setup isn't available" should
+degrade the experience, not break it.
+
+None of this replaces a properly staffed, properly supplied relief
+operation — it's a tool for the people running one, not a substitute for
+them. What it can genuinely do is remove "we have no way to track this"
+as a failure point during the exact window when everything else is
+already strained.
+
 ## Two staff/customer modes
 
 **Customer kiosk (self-service).** Anyone can walk up to the machine, browse
@@ -445,9 +475,49 @@ picked): no Dockerfile or systemd unit, no HTTPS/TLS on the local web kiosk
 breaks), and — as covered above — the SMS transports are verified against
 simulated modems/gateways, not real physical hardware yet.
 
-## Extending it
+## Future implementation
 
-- Add a `reports` command to export daily sales to CSV
-- Add prescription/expiry-date validation before allowing a sale
-- Real per-user staff accounts instead of a shared PIN, with an audit log
-- A Dockerfile/systemd unit once a target deployment machine is chosen
+Ideas that are deliberately not built yet — either because nothing in this
+project needed them, or because they only make sense once a real
+deployment surfaces the actual requirement rather than a guessed one:
+
+**Reporting and accountability**
+- A `reports` command to export daily sales/dispensing logs to CSV, for
+  whatever paperwork a relief operation or pharmacy has to file afterward.
+- Real per-user staff accounts instead of a single shared PIN, with an
+  audit log of who adjusted stock or completed which order — the shared
+  PIN (see "Production-readiness notes" above) is fine for a small team
+  but doesn't scale to accountability across a larger one.
+- Prescription/expiry-date validation before allowing a sale, for
+  medicines where that matters more than emergency throughput does.
+
+**Reaching more people**
+- Vernacular-language SMS commands — right now `ORDER PARA 2` only
+  understands English keywords; the people this is meant to serve don't
+  all read English, and that's a real access gap worth closing.
+- Offline text-to-speech or a simpler, larger-text kiosk mode for elderly
+  users or anyone less comfortable with a touchscreen.
+
+**When there's truly no cell signal either**
+- Support for LoRa/Meshtastic radio, ham radio/APRS, or a satellite
+  messenger as an alternative to SMS, for the scenario the "Reaching a
+  distributor" section already flags as currently unhandled: cell towers
+  themselves down, not just data.
+
+**Once a real multi-site deployment exists**
+- Opportunistic sync between sites when *any* connectivity briefly
+  reappears (a staff phone with signal, a weekly supply-run to a location
+  with WiFi) — batching stock/order deltas rather than requiring the
+  always-on link a cloud sync would need. This is real design work
+  (conflict resolution between two kiosks' concurrent edits, at minimum)
+  and is intentionally not something this project has guessed at without
+  a concrete deployment to design it against — see `docs/networking.md`'s
+  "What this doesn't do" for why that line is drawn where it is today.
+- A pre-built, flashable image for cheap deployment hardware (a Raspberry
+  Pi SD card image, for instance) so a new kiosk is "flash a card, plug
+  it in" rather than "build from source on-site."
+
+None of this is a commitment or a roadmap with dates — it's the honest
+list of "here's what would extend this, and roughly why it isn't built
+yet," kept here so it doesn't get reinvented from scratch by whoever picks
+it up next (including a future me).
