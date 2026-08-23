@@ -192,10 +192,10 @@ it skips (rather than fails) when the network doesn't cooperate, and
 Beyond mesh (which only lets kiosks find each other), when a medicine's
 stock drops to or below its reorder level, it can automatically text a
 distributor/retailer a reorder request over SMS (via either transport
-above), rather than mobile data.
-This matters because in many outages phone/cell signal survives even when
-internet and data connectivity are down — SMS travels over the carrier's
-signalling channel, not the data network.
+above), rather than mobile data. This matters because in many outages
+phone/cell signal survives even when internet and data connectivity are
+down — SMS travels over the carrier's signalling channel, not the data
+network.
 
 If you leave both `-sms-port` and `-sms-gateway-url` unset, alerts still
 fire on schedule but are simply printed to the console instead of sent —
@@ -210,6 +210,20 @@ If there's no cell signal either, SMS won't help — you'd need alternative
 hardware (LoRa/Meshtastic radio, ham radio/APRS, or a satellite messenger)
 or a manual/physical relay process, which this project doesn't currently
 implement.
+
+## Networking principles
+
+The features above (web kiosk, mesh, SMS ordering, SMS alerts) each touch a
+different kind of network, and the short version of how they fit together
+is: every layer degrades to something that still works when the layer
+above it is gone — nothing here ever assumes the internet exists, the web
+kiosk and mesh don't assume WiFi/LAN is reliable beyond broadcast working,
+and SMS doesn't assume anything but bare cell tower signal. `docs/networking.md`
+writes this out in full — what runs at each layer, why mesh has no
+authentication of its own beyond the staff PIN (it assumes a trusted LAN,
+not a public network), and what this deliberately doesn't do (no
+cross-kiosk data sync beyond mesh's live stock lookup, no TLS on local
+traffic) and why those are scoping decisions, not oversights.
 
 ## Requirements to build
 
@@ -307,11 +321,61 @@ placed an order through the customer checkout API, and confirmed via `psql`
 that the stock deduction, order, and order line item all landed correctly
 — and confirmed a real `pg_dump` backup file was produced and readable.
 
+## Deploying
+
+Three ways to actually run this on a real machine, from simplest to most
+involved: copy the binary and run it directly (with a systemd service so it
+auto-restarts), run it with Docker/`docker-compose.yml`, or a bare restart
+loop for hardware that can't run either. Full walkthrough, including the
+mesh-networking-vs-Docker-bridge-networking caveat and an honest note on
+what was and wasn't possible to test end-to-end in this project's own
+development environment, is in `docs/deploying.md`.
+
+## Scaling to more kiosks/locations
+
+MediStock scales the way an offline-first system has to: horizontally, by
+running more independent copies, not by adding capacity to one central
+server (there isn't one). A few different things "scale" can mean here:
+
+- **A single kiosk under heavier local load** — more staff/customers hitting
+  it at once. SQLite defaults to a single writer connection
+  (`internal/db/db.go`), which is intentionally conservative for a small
+  kiosk; if one location genuinely needs more concurrent throughput than
+  that comfortably handles, `-db-driver postgres` removes that
+  single-writer constraint (Postgres handles concurrent writes natively) at
+  the cost of needing a database server running on that machine. This is
+  a per-kiosk decision, not something that needs coordinating across sites.
+- **Rolling out to more locations** — this is the common case, and it's the
+  easy one: every kiosk is fully self-contained (own database, own binary,
+  own config), so adding a tenth or hundredth kiosk is "install and run it
+  there too," not a change to any existing kiosk. There's no shared
+  bottleneck to hit, because there's no shared component at all. Docker
+  makes this repeatable (the same image, deployed the same way, at every
+  site) but even without it, "copy the binary, set the flags for this
+  site" scales fine for as many locations as there are people willing to
+  set up a machine.
+- **Kiosks at the same location coordinating** — this is what mesh
+  networking already does, and it's the ceiling of what this project
+  currently offers for cross-kiosk awareness: kiosks on the same LAN see
+  each other's live stock. There's deliberately no attempt at scaling that
+  into cross-*site* coordination (a camp's kiosks talking to a different
+  camp's kiosks, or a head-office dashboard aggregating all of them) - that
+  would need either an internet link (which this system is built to not
+  require) or a genuine offline-sync protocol, and neither is in scope
+  unless a real future requirement calls for it. See
+  `docs/networking.md`'s "What this doesn't do" section for the reasoning.
+
+In short: the honest scaling story is "add more independent kiosks," which
+this architecture already supports for free, rather than "make one kiosk
+bigger," which was never really the design goal for hardware that's meant
+to be cheap, replaceable, and running unattended in the field.
+
 ## Project layout
 
 ```
 main.go                       entry point — wires everything together, handles flags & shutdown
-internal/db/db.go             SQLite connection + schema migration (auto-creates tables)
+internal/db/                  SQLite/Postgres connection + schema migration (both engines)
+internal/mesh/                multi-kiosk peer discovery (UDP broadcast) + cross-kiosk stock lookup
 internal/models/models.go     data structures: Medicine, Customer, Order, OrderItem
 internal/repo/                database access layer (medicine.go, customer.go, order.go)
 internal/cli/                 interactive terminal menu + kiosk flow
@@ -319,9 +383,12 @@ internal/webui/               local web kiosk (customer + staff pages, HTTP API)
 internal/sms/                 SMS transports: GSM modem (AT commands) and phone HTTP gateway
 internal/smsorder/            SMS order-parsing (LIST/ORDER/HELP commands)
 internal/alerts/              low-stock -> distributor SMS notifications
-internal/backup/              periodic SQLite backups (VACUUM INTO)
+internal/backup/              periodic database backups (VACUUM INTO / pg_dump)
 internal/applog/              shared structured (JSON) logger
 docs/phone-sms-gateway/       reference Termux script for the no-modem SMS option
+docs/deploying.md             how to actually run this on real hardware
+docs/networking.md            how the networking layers (LAN, mesh, SMS) fit together
+Dockerfile, docker-compose.yml container-based deployment (see docs/deploying.md)
 vendor/                       vendored dependencies (for offline builds)
 ```
 

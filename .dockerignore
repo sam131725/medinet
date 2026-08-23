@@ -1,0 +1,8 @@
+*.db
+*.db-journal
+backups/
+_to_delete/
+.idea/
+.git/
+medistock
+medistock.exe

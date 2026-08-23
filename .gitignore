@@ -3,5 +3,7 @@
 *.db-journal
 medistock
 medistock.exe
+__pycache__/
+*.pyc
 .idea/
 _to_delete/

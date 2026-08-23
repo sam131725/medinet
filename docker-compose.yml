@@ -1,0 +1,75 @@
+# Two ways to run this compose file, matching the two database options:
+#
+#   docker compose up                              # SQLite (default, no extra service)
+#   docker compose --profile postgres up            # Postgres, run alongside the app
+#
+# Networking note: Docker's default bridge network gives the container its
+# own internal IP, not your host's real LAN address. That's fine for the
+# web kiosk itself (the "ports:" mapping below makes it reachable from
+# other devices on your WiFi at the host's address). But mesh discovery
+# (-mesh) broadcasts and listens on the LAN directly, and needs the
+# container to see the host's actual network - so for -mesh to work,
+# run with `network_mode: host` (Linux only; see the commented block
+# below) rather than the default bridge network used here.
+
+services:
+  medistock:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - medistock-data:/data
+    restart: unless-stopped
+    command:
+      - -web
+      - -port
+      - "8080"
+      - -db
+      - /data/medistock.db
+      - -backup-dir
+      - /data/backups
+      - -staff-pin
+      - "1234" # change this for anything beyond local testing
+
+    # Uncomment for real -mesh discovery on your LAN (Linux hosts only -
+    # host networking isn't available the same way on Docker Desktop for
+    # Mac/Windows; run the binary directly there instead, see
+    # docs/deploying.md):
+    # network_mode: host
+
+  # Only started when you pass --profile postgres. Swap medistock's
+  # `command:` above for the postgres one commented below to use it.
+  postgres:
+    image: postgres:16
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: medistock
+      POSTGRES_PASSWORD: medistock
+      POSTGRES_DB: medistock
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+    # medistock command for Postgres mode (replace the SQLite one above):
+    # command:
+    #   - -web
+    #   - -port
+    #   - "8080"
+    #   - -db-driver
+    #   - postgres
+    #   - -pg-host
+    #   - postgres
+    #   - -pg-user
+    #   - medistock
+    #   - -pg-password
+    #   - medistock
+    #   - -pg-dbname
+    #   - medistock
+    #   - -backup-dir
+    #   - /data/backups
+    #   - -staff-pin
+    #   - "1234"
+
+volumes:
+  medistock-data:
+  postgres-data:
