@@ -67,8 +67,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/staff/orders", s.staffAuth(s.handleStaffOrders))       // GET
 
 	// Mesh: other MediStock kiosks discovered on the local network
-	mux.HandleFunc("/api/staff/mesh/peers", s.staffAuth(s.handleMeshPeers)) // GET
-	mux.HandleFunc("/api/staff/mesh/find", s.staffAuth(s.handleMeshFind))   // GET ?code=
+	mux.HandleFunc("/api/staff/mesh/peers", s.staffAuth(s.handleMeshPeers))             // GET
+	mux.HandleFunc("/api/staff/mesh/find", s.staffAuth(s.handleMeshFind))               // GET ?code=
+	mux.HandleFunc("/api/staff/mesh/diagnostics", s.staffAuth(s.handleMeshDiagnostics)) // GET
 
 	return withRequestLogging(mux)
 }
@@ -398,6 +399,29 @@ func (s *Server) handleMeshFind(w http.ResponseWriter, r *http.Request) {
 	}
 	results := mesh.FindAcrossPeers(s.discovery.Peers(), code)
 	writeJSON(w, http.StatusOK, results)
+}
+
+// handleMeshDiagnostics exposes Discovery's recent send/receive packet
+// history to the staff page - a "Network diagnostics" panel that lets
+// someone at the kiosk (or looking at a support screenshot) actually see
+// what's happening at the packet level on the mesh discovery port, rather
+// than just "peers aren't showing up" with no visibility into why.
+func (s *Server) handleMeshDiagnostics(w http.ResponseWriter, r *http.Request) {
+	if s.discovery == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"enabled": false})
+		return
+	}
+	diag := s.discovery.Diagnostics()
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled":      true,
+		"nodeId":       diag.NodeID,
+		"name":         diag.Name,
+		"httpAddr":     diag.HTTPAddr,
+		"udpPort":      diag.UDPPort,
+		"broadcastDst": diag.BroadcastDst,
+		"listenError":  diag.ListenError,
+		"events":       diag.Events,
+	})
 }
 
 func (s *Server) handleStaffOrders(w http.ResponseWriter, r *http.Request) {

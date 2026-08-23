@@ -191,7 +191,13 @@ others, building a live peer list automatically — that's the zero-config
 path. On the staff page, a "Nearby kiosks" panel lists everyone currently
 discovered, and a medicine-code search asks every known peer whether they
 have it in stock (over the same `/api/medicines` endpoint the peer's own
-customer kiosk page already uses — no extra API needed on their end).
+customer kiosk page already uses — no extra API needed on their end). A
+"Network diagnostics" panel below it shows, live, every packet this
+kiosk's mesh discovery actually sends and receives on the wire — remote
+address, raw payload (hex), and what happened to it — so figuring out why
+two kiosks aren't finding each other doesn't require SSH access to the
+machine. See `docs/networking.md` for more on how it works and how to
+read it.
 
 Some networks — locked-down enterprise WiFi, and some cloud/virtualized
 network setups — block UDP broadcast between devices as a security measure.

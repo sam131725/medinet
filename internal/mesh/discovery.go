@@ -40,6 +40,46 @@ type beacon struct {
 // the network) - mirrors how real mesh/discovery protocols age out peers.
 const staleAfter = 30 * time.Second
 
+// maxDiagEvents caps how many recent packet events Discovery remembers for
+// the diagnostics view - enough to see what's happening right now without
+// growing unbounded on a kiosk that runs for weeks.
+const maxDiagEvents = 50
+
+// DiagEvent is one UDP packet MediStock's mesh discovery sent or received,
+// kept around for the staff "Network diagnostics" panel - the point is to
+// let someone standing at the kiosk (or looking at a support screenshot)
+// actually see what's happening at the packet level, instead of just "it's
+// not working" with no visibility into why. This deliberately only inspects
+// MediStock's own discovery socket (no raw packet capture, no extra OS
+// privileges needed) - broad enough to answer "is this kiosk sending/
+// receiving anything at all on the mesh port," which is the actual
+// question when broadcast discovery seems stuck.
+type DiagEvent struct {
+	Time       time.Time `json:"time"`
+	Direction  string    `json:"direction"` // "out" (we sent) or "in" (we received)
+	RemoteAddr string    `json:"remoteAddr"`
+	Bytes      int       `json:"bytes"`
+	HexPreview string    `json:"hexPreview"` // first bytes of the raw payload, hex-encoded
+	Parsed     bool      `json:"parsed"`
+	PeerID     string    `json:"peerId,omitempty"`
+	PeerName   string    `json:"peerName,omitempty"`
+	Note       string    `json:"note"`
+}
+
+// Diagnostics is the full diagnostic snapshot returned to the staff page:
+// this node's own identity/config plus its recent packet history, so
+// someone debugging "why can't kiosk A see kiosk B" has everything needed
+// in one place rather than needing shell/log access to the machine.
+type Diagnostics struct {
+	NodeID       string      `json:"nodeId"`
+	Name         string      `json:"name"`
+	HTTPAddr     string      `json:"httpAddr"`
+	UDPPort      int         `json:"udpPort"`
+	BroadcastDst string      `json:"broadcastDst"`
+	ListenError  string      `json:"listenError,omitempty"`
+	Events       []DiagEvent `json:"events"` // most recent first
+}
+
 // Discovery broadcasts this node's presence and tracks peers announcing
 // themselves the same way.
 type Discovery struct {
@@ -49,8 +89,10 @@ type Discovery struct {
 	udpPort  int
 	log      *slog.Logger
 
-	mu    sync.Mutex
-	peers map[string]Peer
+	mu         sync.Mutex
+	peers      map[string]Peer
+	diagEvents []DiagEvent
+	listenErr  string
 }
 
 // New creates a Discovery instance. name is a human-readable label for this
@@ -141,12 +183,55 @@ func (d *Discovery) Peers() []Peer {
 	return out
 }
 
+// recordEvent appends a diagnostic event, trimming the oldest once the
+// ring buffer is full.
+func (d *Discovery) recordEvent(e DiagEvent) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.diagEvents = append(d.diagEvents, e)
+	if len(d.diagEvents) > maxDiagEvents {
+		d.diagEvents = d.diagEvents[len(d.diagEvents)-maxDiagEvents:]
+	}
+}
+
+func hexPreview(b []byte) string {
+	const max = 32
+	if len(b) <= max {
+		return hex.EncodeToString(b)
+	}
+	return hex.EncodeToString(b[:max]) + "..."
+}
+
+// Diagnostics returns this node's identity/config plus its recent
+// send/receive packet history, most recent first - see DiagEvent.
+func (d *Discovery) Diagnostics() Diagnostics {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	events := make([]DiagEvent, len(d.diagEvents))
+	copy(events, d.diagEvents)
+	for i, j := 0, len(events)-1; i < j; i, j = i+1, j-1 {
+		events[i], events[j] = events[j], events[i]
+	}
+	return Diagnostics{
+		NodeID:       d.nodeID,
+		Name:         d.name,
+		HTTPAddr:     d.httpAddr,
+		UDPPort:      d.udpPort,
+		BroadcastDst: fmt.Sprintf("%s:%d", net.IPv4bcast.String(), d.udpPort),
+		ListenError:  d.listenErr,
+		Events:       events,
+	}
+}
+
 // Run broadcasts this node's beacon every 5 seconds and listens for other
 // nodes' beacons, until ctx is cancelled. Intended to run in its own
 // goroutine for the process lifetime.
 func (d *Discovery) Run(ctx context.Context) {
 	conn, err := net.ListenPacket("udp4", fmt.Sprintf(":%d", d.udpPort))
 	if err != nil {
+		d.mu.Lock()
+		d.listenErr = err.Error()
+		d.mu.Unlock()
 		if d.log != nil {
 			d.log.Warn("mesh discovery disabled: could not listen for peer beacons", "error", err)
 		}
@@ -177,9 +262,19 @@ func (d *Discovery) broadcastLoop(ctx context.Context, conn net.PacketConn) {
 }
 
 func (d *Discovery) sendBeacon(conn net.PacketConn, dst net.Addr, payload []byte) {
-	if _, err := conn.WriteTo(payload, dst); err != nil && d.log != nil {
-		d.log.Debug("mesh: failed to send beacon", "error", err)
+	_, err := conn.WriteTo(payload, dst)
+	note := "beacon broadcast"
+	if err != nil {
+		note = "broadcast failed: " + err.Error()
+		if d.log != nil {
+			d.log.Debug("mesh: failed to send beacon", "error", err)
+		}
 	}
+	d.recordEvent(DiagEvent{
+		Time: time.Now(), Direction: "out", RemoteAddr: dst.String(),
+		Bytes: len(payload), HexPreview: hexPreview(payload), Parsed: err == nil,
+		PeerID: d.nodeID, PeerName: d.name, Note: note,
+	})
 }
 
 func (d *Discovery) listenLoop(ctx context.Context, conn net.PacketConn) {
@@ -190,15 +285,31 @@ func (d *Discovery) listenLoop(ctx context.Context, conn net.PacketConn) {
 	}()
 
 	for {
-		n, _, err := conn.ReadFrom(buf)
+		n, remote, err := conn.ReadFrom(buf)
 		if err != nil {
 			return // context cancelled / connection closed
 		}
+		raw := append([]byte(nil), buf[:n]...) // ReadFrom reuses buf next iteration
+		remoteAddr := ""
+		if remote != nil {
+			remoteAddr = remote.String()
+		}
+
 		var b beacon
-		if err := json.Unmarshal(buf[:n], &b); err != nil {
+		if err := json.Unmarshal(raw, &b); err != nil {
+			d.recordEvent(DiagEvent{
+				Time: time.Now(), Direction: "in", RemoteAddr: remoteAddr,
+				Bytes: n, HexPreview: hexPreview(raw), Parsed: false,
+				Note: "not a MediStock beacon (unrecognized payload) - ignored",
+			})
 			continue // not one of ours - ignore
 		}
 		if b.ID == d.nodeID {
+			d.recordEvent(DiagEvent{
+				Time: time.Now(), Direction: "in", RemoteAddr: remoteAddr,
+				Bytes: n, HexPreview: hexPreview(raw), Parsed: true,
+				PeerID: b.ID, PeerName: b.Name, Note: "our own broadcast, echoed back - ignored",
+			})
 			continue // our own broadcast, echoed back - ignore
 		}
 
@@ -207,8 +318,17 @@ func (d *Discovery) listenLoop(ctx context.Context, conn net.PacketConn) {
 		d.peers[b.ID] = Peer{ID: b.ID, Name: b.Name, HTTPAddr: b.HTTPAddr, LastSeen: time.Now()}
 		d.mu.Unlock()
 
-		if !known && d.log != nil {
-			d.log.Info("mesh: discovered new peer kiosk", "peerID", b.ID, "peerName", b.Name, "peerAddr", b.HTTPAddr)
+		note := "known peer refreshed"
+		if !known {
+			note = "new peer discovered"
+			if d.log != nil {
+				d.log.Info("mesh: discovered new peer kiosk", "peerID", b.ID, "peerName", b.Name, "peerAddr", b.HTTPAddr)
+			}
 		}
+		d.recordEvent(DiagEvent{
+			Time: time.Now(), Direction: "in", RemoteAddr: remoteAddr,
+			Bytes: n, HexPreview: hexPreview(raw), Parsed: true,
+			PeerID: b.ID, PeerName: b.Name, Note: note,
+		})
 	}
 }

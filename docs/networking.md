@@ -52,6 +52,23 @@ locked-down networks block UDP broadcast outright as a security measure.
 bypassing broadcast entirely. Either way, mesh traffic never leaves the
 local network — there's no server anywhere it phones home to.
 
+Figuring out *why* two kiosks aren't finding each other used to mean SSH
+access and reading logs by hand. The staff page's "Network diagnostics"
+panel exists so that doesn't need shell access at all: it shows, live,
+every UDP packet this kiosk's mesh discovery has actually sent or
+received on the wire — timestamp, remote address, byte count, a hex
+preview of the raw payload, and a plain-language note on what happened to
+it (a new peer discovered, a known peer refreshed, this node's own
+broadcast echoing back, or a packet that wasn't a MediStock beacon at
+all). It's a small, purpose-built packet inspector scoped to this one
+protocol rather than a general-purpose sniffer — it only ever looks at
+traffic on MediStock's own discovery socket, so it needs no raw-socket
+privileges and no extra OS-level access to run. If a kiosk shows plenty
+of outbound "beacon broadcast" events but zero inbound packets from
+anyone else, that's the diagnostic panel telling you broadcast is being
+blocked on that network — the same failure mode documented above, now
+visible without needing to reproduce it in a terminal.
+
 A deliberate trade-off worth naming: mesh discovery and the cross-kiosk
 stock lookup have no authentication of their own beyond whatever the
 staff PIN already protects on each kiosk's own API. The assumption is that

@@ -411,6 +411,16 @@ const staffPageHTML = `<!DOCTYPE html>
       <div id="mesh-find-results" style="margin-top:10px;"></div>
     </div>
 
+    <div class="card">
+      <h2>Network diagnostics</h2>
+      <p style="font-size:13px;color:var(--muted);margin-top:0;">What this kiosk's mesh networking is actually sending and receiving on the wire, right now - for figuring out why two kiosks aren't finding each other without needing shell access to the machine.</p>
+      <div id="diag-status" style="font-size:13px;margin-bottom:10px;"></div>
+      <table id="diag-table">
+        <thead><tr><th>Time</th><th>Dir</th><th>Remote</th><th>Bytes</th><th>Payload (hex)</th><th>What happened</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
   </div>
 </div>
 
@@ -441,6 +451,54 @@ async function refreshAll() {
   await loadInventory();
   await loadOrders();
   await loadMeshPeers();
+  await loadMeshDiagnostics();
+  // Diagnostics reflect live wire traffic, so keep them refreshing on their
+  // own rather than only on a manual page action.
+  if (!window.__diagInterval) {
+    window.__diagInterval = setInterval(loadMeshDiagnostics, 4000);
+  }
+}
+
+async function loadMeshDiagnostics() {
+  const statusEl = document.getElementById('diag-status');
+  const tbody = document.querySelector('#diag-table tbody');
+  try {
+    const res = await staffFetch('/api/staff/mesh/diagnostics');
+    const data = await res.json();
+    if (!data.enabled) {
+      statusEl.textContent = 'Mesh networking is not enabled on this kiosk (start with -mesh-name to turn it on) - nothing to diagnose.';
+      tbody.innerHTML = '';
+      return;
+    }
+    let status = 'Node ' + data.nodeId + ' listening on UDP port ' + data.udpPort +
+      ', broadcasting to ' + data.broadcastDst + '.';
+    if (data.listenError) {
+      status += ' Could not open the UDP socket at all: ' + data.listenError + ' - mesh discovery is disabled on this kiosk until that is fixed.';
+    } else if (!data.events || data.events.length === 0) {
+      status += ' No packets sent or received yet.';
+    } else {
+      const received = data.events.filter(e => e.direction === 'in').length;
+      status += ' ' + data.events.length + ' recent packet(s), ' + received + ' received.';
+    }
+    statusEl.textContent = status;
+
+    tbody.innerHTML = '';
+    (data.events || []).forEach(e => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td>';
+      tr.children[0].textContent = new Date(e.time).toLocaleTimeString();
+      tr.children[1].textContent = e.direction === 'out' ? 'sent' : 'recv';
+      tr.children[2].textContent = e.remoteAddr || '-';
+      tr.children[3].textContent = e.bytes;
+      tr.children[4].textContent = e.hexPreview;
+      tr.children[4].style.fontFamily = 'monospace';
+      tr.children[4].style.fontSize = '11px';
+      tr.children[5].textContent = e.note;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    statusEl.textContent = 'Could not load network diagnostics.';
+  }
 }
 
 async function loadMeshPeers() {
